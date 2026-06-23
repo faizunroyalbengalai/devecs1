@@ -1,6 +1,5 @@
 terraform {
   backend "s3" {
-    key     = "devecs1/terraform.tfstate"
     encrypt = true
     # bucket and region passed via -backend-config at init time
   }
@@ -99,6 +98,20 @@ variable "spring_mongodb_uri" {
   sensitive = true
 }
 
+# RDS credentials (required when provisioning RDS)
+variable "rds_db_name" {
+  type    = string
+  default = ""
+}
+variable "rds_db_username" {
+  type    = string
+  default = ""
+}
+variable "rds_db_password" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
 
 locals {
   # ECR names must be lowercase alphanumeric and hyphens only
@@ -108,16 +121,19 @@ locals {
   # Truncate to 24 chars to leave room for suffixes like "-alb", "-tg", "-sg"
   name_safe = trimsuffix(substr(replace(var.project_name, "_", "-"), 0, 24), "-")
 
-  # ── External DB: construct DATABASE_URL from supplied components ──────────────
-  _ext_scheme  = "postgresql+asyncpg"
-  _ext_port    = var.db_port != "" ? var.db_port : "5432"
-  _auto_db_url = var.db_host != "" ? "${local._ext_scheme}://${var.db_username}:${var.db_password}@${var.db_host}:${local._ext_port}/${var.db_name}" : ""
+  # ── RDS: construct URLs from the Terraform-created RDS instance ───────────────
+  _rds_db_name = var.rds_db_name != "" ? var.rds_db_name : "${replace(var.project_name, "-", "_")}db"
+  _rds_user    = var.rds_db_username != "" ? var.rds_db_username : "appuser"
+  _rds_port    = "5432"
+  # Async scheme for Python (SQLAlchemy) apps
+  _rds_scheme  = "postgresql+asyncpg"
+  _auto_db_url = "${local._rds_scheme}://${local._rds_user}:${var.rds_db_password}@${aws_db_instance.main.address}:${local._rds_port}/${local._rds_db_name}"
   _db_url      = var.database_url != "" ? var.database_url : local._auto_db_url
-  _db_host     = var.db_host
-  _db_port     = local._ext_port
-  _db_name     = var.db_name
-  _db_user     = var.db_username
-  _db_password = var.db_password
+  _db_host     = aws_db_instance.main.address
+  _db_port     = tostring(aws_db_instance.main.port)
+  _db_name     = local._rds_db_name
+  _db_user     = local._rds_user
+  _db_password = var.rds_db_password
   _spring_ds_url  = var.spring_datasource_url
   _spring_ds_user = var.spring_datasource_user
   _spring_ds_pass = var.spring_datasource_pass
@@ -215,6 +231,46 @@ resource "aws_security_group" "ecs_tasks" {
   lifecycle { create_before_destroy = true }
 }
 
+resource "aws_security_group" "rds" {
+  name   = "${local.name_safe}-rds-sg"
+  vpc_id = data.aws_vpc.default.id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_tasks.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_db_subnet_group" "main" {
+  name       = "${local.name_safe}-db-subnet"
+  subnet_ids = data.aws_subnets.default.ids
+}
+
+resource "aws_db_instance" "main" {
+  identifier             = "${local.name_safe}-db"
+  engine                 = "postgres"
+  engine_version         = "15"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  db_name                = var.rds_db_name != "" ? var.rds_db_name : "${replace(var.project_name, "-", "_")}db"
+  username               = var.rds_db_username != "" ? var.rds_db_username : "appuser"
+  password               = var.rds_db_password
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+}
 
 # ── ALB ────────────────────────────────────────────────────────────────────────
 resource "aws_lb" "main" {
